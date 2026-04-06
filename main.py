@@ -1,126 +1,112 @@
-import requests
-from bs4 import BeautifulSoup
-import re
+import os
 import streamlit as st
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from PyPDF2 import PdfReader
+from dotenv import load_dotenv
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
-from dotenv import load_dotenv
-import os
 import google.generativeai as genai
 
-# Load environment variables
+# Load environment variables from .env
 load_dotenv()
-
-# Configure Google Generative AI
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-# Suppress insecure request warnings
-requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+# Function to extract text from PDFs
+def get_pdf_text(pdf_docs):
+    text = ""
+    for pdf in pdf_docs:
+        pdf_reader = PdfReader(pdf)
+        for page in pdf_reader.pages:
+            content = page.extract_text()
+            if content:
+                text += content
+    return text
 
-def scrape_html(url):
-    scraped_chunks = []
-    try:
-        with requests.get(url, verify=False) as response:
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            text_content = soup.get_text(strip=True)
-            cleaned_text = clean_text(text_content) 
-            st.write("\nMain Page Text content:")
-            st.write(cleaned_text)  # Print main page content for verification
-            scraped_chunks.append(cleaned_text)
-            # Find and scrape links within the main page
-            links = soup.find_all('a', href=True)
-            if links:
-                for link in links:
-                    link_url = link.get('href')
-                    if is_valid_link(link_url):
-                        st.write(f"Scraping linked page: {link_url}")
-                        scrape_linked_page(link_url, scraped_chunks)
-            process_chunks(scraped_chunks)
-    except requests.RequestException as e:
-        st.error(f"Error: Could not retrieve HTML content from {url}. Error: {e}")
-    except Exception as e:
-        st.error(f"An unexpected error occurred while scraping {url}. Error: {e}")
+# Function to split text into chunks
+def get_text_chunks(text):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,    
+        chunk_overlap=200
+    )
+    return text_splitter.create_documents([text])
 
-def scrape_linked_page(link_url, scraped_chunks):
-    try:
-        with requests.get(link_url, verify=False) as response:
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            text_content = soup.get_text(strip=True)
-            cleaned_text = clean_text(text_content)
-            st.write("\nLinked Page Text content:")
-            st.write(cleaned_text)  # Print linked page content for verification
-            scraped_chunks.append(cleaned_text)
-            # Find and scrape links within the linked page
-            links = soup.find_all('a', href=True)
-            if links:
-                for link in links:
-                    inner_link_url = link.get('href')
-                    if is_valid_link(inner_link_url):
-                        st.write(f"Scraping linked page: {inner_link_url}")
-                        scrape_linked_page(inner_link_url, scraped_chunks)
-    except requests.RequestException as e:
-        st.error(f"Error: Could not retrieve HTML content from {link_url}. Error: {e}")
-    except Exception as e:
-        st.error(f"An unexpected error occurred while scraping {link_url}. Error: {e}")
+# Function to store text chunks in vector DB (FAISS)
+def get_vector_store(text_chunks):
+    embeddings = HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2"
+    )
 
-def clean_text(text):
-    # Keep only English language characters, numbers, and common punctuation marks
-    cleaned_text = re.sub(r'[^\x00-\x7F]+', ' ', text)
-    cleaned_text = re.sub(r'[^\w\s.,]', '', cleaned_text)
-    return cleaned_text
+    vector_store = FAISS.from_documents(text_chunks, embeddings)
+    vector_store.save_local("faiss_index")
 
-def process_chunks(chunks):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    faiss_db = FAISS.from_texts(chunks, embeddings)
-    faiss_db.save_local("faiss_index")
-    st.write("\nProcessed and saved chunks.")
 
+
+# Define question-answering chain
 def get_conversation_chain():
-    prompt_template = """ 
-    Answer the question as detailed as possible based on the text content scraped from the web.\n
-    If the answer is not available in the scraped content, please indicate so.\n\n
-    Context:\n
-    {context}\n\n
-    Question:\n
-    {question}\n\n
+    prompt_template = """
+    Answer the question as detailed as possible from the provided context.
+    If the answer is not in the context, just say: "answer is not available in the context".
+
+    Context:
+    {context}
+
+    Question:
+    {question}
+
     Answer:
     """
-    model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.3)
+
+    model = ChatGoogleGenerativeAI(model="gemini-2.5-flash",temperature=0.3)    
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    return load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    chain = load_qa_chain(model, chain_type="stuff", prompt=prompt)
+    return chain
 
+# Function to handle user query
 def user_input(user_question):
-    new_db = FAISS.load_local("faiss_index", GoogleGenerativeAIEmbeddings(model="models/embedding-001"), allow_dangerous_deserialization=True)
+    embeddings = HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2"
+    )
+
+    new_db = FAISS.load_local(
+        "faiss_index",
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
+
     docs = new_db.similarity_search(user_question)
-    print("Documents returned by similarity search:", docs)  # Print returned documents
     chain = get_conversation_chain()
-    response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)
-    print("Conversation Chain Output:", response)  # Print conversation chain output
-    st.write("Reply: ", response["output_text"])
 
-def is_valid_link(link_url):
-    # Check if the link URL is not a document, image, Gmail link, or contact number
-    if (not re.match(r'.+\.(pdf|docx?|xlsx?|pptx?|jpg|jpeg|png|gif)', link_url, re.IGNORECASE) and 
-        not 'mail.google.com' in link_url and 
-        not re.match(r'tel:\d+', link_url)):
-        return True
-    else:
-        return False
+    response = chain(
+        {"input_documents": docs, "question": user_question},
+        return_only_outputs=True
+    )
 
+    st.write("Reply:", response["output_text"])
+
+
+
+# Streamlit main app
 def main():
-    st.set_page_config("Scrapped Data")
-    st.header("Chat with Scrapped Data using Gemini")
-    user_question = st.text_input("Ask a Question:")
-    if st.button("Enter") and user_question:
+    st.set_page_config(page_title="Chat with PDF", layout="wide")
+    st.header("📄 Chat with PDF using Gemini Pro")
+
+    user_question = st.text_input("Ask a question about your PDF:")
+
+    if st.button("Get Answer") and user_question:
         user_input(user_question)
-    target_url = st.text_input("Enter the website link")   
-    if st.button("Scrape HTML") and target_url:
-        scrape_html(target_url)
+
+    with st.sidebar:
+        st.title("📁 Upload PDF")
+        pdf_docs = st.file_uploader("Upload your PDF file(s):", accept_multiple_files=True)
+        if st.button("Submit & Process") and pdf_docs:
+            with st.spinner("Processing..."):
+                raw_text = get_pdf_text(pdf_docs)
+                text_chunks = get_text_chunks(raw_text)
+                get_vector_store(text_chunks)
+                st.success("✅ PDF processed successfully!")
 
 if __name__ == "__main__":
     main()
